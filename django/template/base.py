@@ -131,13 +131,19 @@ class Template(object):
                 yield subnode
 
     def _render(self, context):
-        return self.nodelist.render(context)
+        return ''.join(self._stream(context))
 
     def render(self, context):
+        return ''.join(self.stream(context))
+
+    def _stream(self, context):
+        return self.nodelist.stream(context)
+
+    def stream(self, context):
         "Display stage -- can be called many times"
         context.render_context.push()
         try:
-            return self._render(context)
+            return self._stream(context)
         finally:
             context.render_context.pop()
 
@@ -801,6 +807,9 @@ class Node(object):
         """
         pass
 
+    def stream(self, context):
+        yield self.render(context)
+
     def __iter__(self):
         yield self
 
@@ -823,15 +832,16 @@ class NodeList(list):
     # extend_nodelist().
     contains_nontext = False
 
-    def render(self, context):
-        bits = []
+    def stream(self, context):
         for node in self:
             if isinstance(node, Node):
-                bit = self.render_node(node, context)
+                for bit in self.stream_node(node, context):
+                    yield mark_safe(force_text(bit))
             else:
-                bit = node
-            bits.append(force_text(bit))
-        return mark_safe(''.join(bits))
+                yield mark_safe(force_text(node))
+
+    def render(self, context):
+        return ''.join(self.stream(context))
 
     def get_nodes_by_type(self, nodetype):
         "Return a list of all nodes of the given type"
@@ -839,6 +849,9 @@ class NodeList(list):
         for node in self:
             nodes.extend(node.get_nodes_by_type(nodetype))
         return nodes
+
+    def stream_node(self, node, context):
+        return node.stream(context)
 
     def render_node(self, node, context):
         return node.render(context)

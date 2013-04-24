@@ -1,4 +1,4 @@
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.template import loader, Context, RequestContext
 from django.utils import six
 
@@ -7,7 +7,7 @@ class ContentNotRenderedError(Exception):
     pass
 
 
-class SimpleTemplateResponse(HttpResponse):
+class SimpleTemplateResponseMixin(object):
     rendering_attrs = ['template_name', 'context_data', '_post_render_callbacks']
 
     def __init__(self, template, context=None, content_type=None, status=None,
@@ -23,7 +23,7 @@ class SimpleTemplateResponse(HttpResponse):
         # content argument doesn't make sense here because it will be replaced
         # with rendered template so we always pass empty string in order to
         # prevent errors and provide shorter signature.
-        super(SimpleTemplateResponse, self).__init__('', content_type, status,
+        super(SimpleTemplateResponseMixin, self).__init__('', content_type, status,
                                                      mimetype)
 
         # _is_rendered tracks whether the template and context has been baked
@@ -40,7 +40,7 @@ class SimpleTemplateResponse(HttpResponse):
         rendered, and that the pickled state only includes rendered
         data, not the data used to construct the response.
         """
-        obj_dict = super(SimpleTemplateResponse, self).__getstate__()
+        obj_dict = super(SimpleTemplateResponseMixin, self).__getstate__()
         if not self._is_rendered:
             raise ContentNotRenderedError('The response content must be '
                                           'rendered before it can be pickled.')
@@ -68,6 +68,68 @@ class SimpleTemplateResponse(HttpResponse):
         else:
             return Context(context)
 
+    def add_post_render_callback(self, callback):
+        """Adds a new post-rendering callback.
+
+        If the response has already been rendered,
+        invoke the callback immediately.
+        """
+        if self._is_rendered:
+            callback(self)
+        else:
+            self._post_render_callbacks.append(callback)
+
+    @property
+    def is_rendered(self):
+        return self._is_rendered
+
+    def __iter__(self):
+        if not self._is_rendered:
+            raise ContentNotRenderedError('The response content must be '
+                                          'rendered before it can be iterated over.')
+        return super(SimpleTemplateResponseMixin, self).__iter__()
+
+
+class TemplateResponseMixin(object):
+    rendering_attrs = SimpleTemplateResponseMixin.rendering_attrs + \
+        ['_request', '_current_app']
+
+    def __init__(self, request, template, context=None, content_type=None,
+            status=None, mimetype=None, current_app=None):
+        # self.request gets over-written by django.test.client.Client - and
+        # unlike context_data and template_name the _request should not
+        # be considered part of the public API.
+        self._request = request
+        # As a convenience we'll allow callers to provide current_app without
+        # having to avoid needing to create the RequestContext directly
+        self._current_app = current_app
+        super(TemplateResponseMixin, self).__init__(
+            template, context, content_type, status, mimetype)
+
+    def resolve_context(self, context):
+        """Convert context data into a full RequestContext object
+        (assuming it isn't already a Context object).
+        """
+        if isinstance(context, Context):
+            return context
+        return RequestContext(self._request, context, current_app=self._current_app)
+
+
+class SimpleTemplateResponse(SimpleTemplateResponseMixin, HttpResponse):
+    @property
+    def content(self):
+        if not self._is_rendered:
+            raise ContentNotRenderedError('The response content must be '
+                                          'rendered before it can be accessed.')
+        return super(SimpleTemplateResponse, self).content
+
+    @content.setter
+    def content(self, value):
+        """Sets the content for the response
+        """
+        HttpResponse.content.fset(self, value)
+        self._is_rendered = True
+
     @property
     def rendered_content(self):
         """Returns the freshly rendered content for the template and context
@@ -81,17 +143,6 @@ class SimpleTemplateResponse(HttpResponse):
         context = self.resolve_context(self.context_data)
         content = template.render(context)
         return content
-
-    def add_post_render_callback(self, callback):
-        """Adds a new post-rendering callback.
-
-        If the response has already been rendered,
-        invoke the callback immediately.
-        """
-        if self._is_rendered:
-            callback(self)
-        else:
-            self._post_render_callbacks.append(callback)
 
     def render(self):
         """Renders (thereby finalizing) the content of the response.
@@ -109,51 +160,56 @@ class SimpleTemplateResponse(HttpResponse):
                     retval = newretval
         return retval
 
-    @property
-    def is_rendered(self):
-        return self._is_rendered
 
-    def __iter__(self):
-        if not self._is_rendered:
-            raise ContentNotRenderedError('The response content must be '
-                                          'rendered before it can be iterated over.')
-        return super(SimpleTemplateResponse, self).__iter__()
+class TemplateResponse(TemplateResponseMixin, SimpleTemplateResponse):
+    pass
 
+
+class StreamingSimpleTemplateResponse(SimpleTemplateResponseMixin, StreamingHttpResponse):
     @property
-    def content(self):
+    def streaming_content(self):
         if not self._is_rendered:
             raise ContentNotRenderedError('The response content must be '
                                           'rendered before it can be accessed.')
-        return super(SimpleTemplateResponse, self).content
+        return super(StreamingSimpleTemplateResponse, self).content
 
-    @content.setter
-    def content(self, value):
+    @streaming_content.setter
+    def streaming_content(self, value):
         """Sets the content for the response
         """
-        HttpResponse.content.fset(self, value)
+        StreamingHttpResponse.streaming_content.fset(self, value)
         self._is_rendered = True
 
+    @property
+    def rendered_content(self):
+        """Returns the freshly rendered content for the template and context
+        described by the TemplateResponse.
 
-class TemplateResponse(SimpleTemplateResponse):
-    rendering_attrs = SimpleTemplateResponse.rendering_attrs + \
-        ['_request', '_current_app']
-
-    def __init__(self, request, template, context=None, content_type=None,
-            status=None, mimetype=None, current_app=None):
-        # self.request gets over-written by django.test.client.Client - and
-        # unlike context_data and template_name the _request should not
-        # be considered part of the public API.
-        self._request = request
-        # As a convenience we'll allow callers to provide current_app without
-        # having to avoid needing to create the RequestContext directly
-        self._current_app = current_app
-        super(TemplateResponse, self).__init__(
-            template, context, content_type, status, mimetype)
-
-    def resolve_context(self, context):
-        """Convert context data into a full RequestContext object
-        (assuming it isn't already a Context object).
+        This *does not* set the final content of the response. To set the
+        response content, you must either call render(), or set the
+        content explicitly using the value of this property.
         """
-        if isinstance(context, Context):
-            return context
-        return RequestContext(self._request, context, current_app=self._current_app)
+        template = self.resolve_template(self.template_name)
+        context = self.resolve_context(self.context_data)
+        content = template.stream(context)
+        return content
+
+    def render(self):
+        """Renders (thereby finalizing) the content of the response.
+
+        If the content has already been rendered, this is a no-op.
+
+        Returns the baked response instance.
+        """
+        retval = self
+        if not self._is_rendered:
+            self.streaming_content = self.rendered_content
+            for post_callback in self._post_render_callbacks:
+                newretval = post_callback(retval)
+                if newretval is not None:
+                    retval = newretval
+        return retval
+
+
+class StreamingTemplateResponse(TemplateResponseMixin, StreamingSimpleTemplateResponse):
+    pass
