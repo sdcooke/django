@@ -39,6 +39,14 @@ from django.conf import settings
 from django.core.signals import request_finished
 from django.utils.six.moves import _thread as thread
 
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import PatternMatchingEventHandler
+    watchdog = True
+except ImportError:
+    watchdog = False
+
+
 # This import does nothing, but it's necessary to avoid some race conditions
 # in the threading module. See http://code.djangoproject.com/ticket/2330 .
 try:
@@ -269,6 +277,34 @@ def reloader_thread():
         time.sleep(1)
 
 
+def watchdog_thread():
+    global STOP_WATCHDOG
+    STOP_WATCHDOG = False
+
+    class FileEventHandler(PatternMatchingEventHandler):
+        def on_any_event(self, event):
+            global STOP_WATCHDOG
+            STOP_WATCHDOG = True
+
+    event_handler = FileEventHandler(patterns=['*.py', '*.pyc', '*.pyo'])
+
+    observer = Observer()
+    observer.schedule(event_handler, '.', recursive=True)
+    # TODO: handle translations with reset_translations in a second call to schedule
+    observer.start()
+
+    try:
+        while RUN_RELOADER and not STOP_WATCHDOG:
+            time.sleep(1)
+    finally:
+        observer.stop()
+
+    observer.join()
+
+    if STOP_WATCHDOG:
+        sys.exit(3)
+
+
 def restart_with_reloader():
     while True:
         args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions] + sys.argv
@@ -285,7 +321,10 @@ def python_reloader(main_func, args, kwargs):
     if os.environ.get("RUN_MAIN") == "true":
         thread.start_new_thread(main_func, args, kwargs)
         try:
-            reloader_thread()
+            if watchdog:
+                watchdog_thread()
+            else:
+                reloader_thread()
         except KeyboardInterrupt:
             pass
     else:
